@@ -6,8 +6,13 @@ Collects and exports training metrics for UI visualization.
 import os
 import json
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Any
 from pathlib import Path
+
+try:
+    import torch
+except ImportError:  # pragma: no cover
+    torch = None  # type: ignore[assignment]
 
 
 class AlphaMetricsLogger:
@@ -63,11 +68,11 @@ class AlphaMetricsLogger:
         if learning_rates is not None and len(learning_rates) > 0:
             # MoE: multiple learning rates
             for i, lr in enumerate(learning_rates):
-                lr_val = lr.item() if hasattr(lr, 'item') else lr
+                lr_val = self._to_serializable(lr)
                 metrics[f'lr_{i}'] = lr_val
         elif learning_rate is not None:
             # Single learning rate
-            metrics['learning_rate'] = learning_rate
+            metrics['learning_rate'] = self._to_serializable(learning_rate)
 
         # Add alpha scheduler state if available
         if scheduler and hasattr(scheduler, 'enabled') and scheduler.enabled:
@@ -93,9 +98,7 @@ class AlphaMetricsLogger:
                         if slope is not None:
                             metrics['loss_slope'] = slope
                             metrics['loss_r2'] = r2
-                            metrics['loss_samples'] = len(stats.recent_losses)
-                        else:
-                            metrics['loss_samples'] = len(stats.recent_losses)
+                        metrics['loss_samples'] = len(stats.recent_losses)
 
                     if hasattr(stats, 'get_gradient_stability'):
                         metrics['gradient_stability_avg'] = stats.get_gradient_stability()
@@ -123,14 +126,40 @@ class AlphaMetricsLogger:
 
         # Write to JSONL file (one line per step)
         try:
+            serializable_metrics = {
+                key: self._to_serializable(value)
+                for key, value in metrics.items()
+            }
             with open(self.metrics_file, 'a') as f:
-                f.write(json.dumps(metrics) + '\n')
+                f.write(json.dumps(serializable_metrics) + '\n')
         except Exception as e:
             print(f"Warning: Failed to write metrics: {e}")
 
     def get_metrics_file_path(self) -> str:
         """Get the path to the metrics file."""
         return self.metrics_file
+
+    @staticmethod
+    def _to_serializable(value: Any) -> Any:
+        """Safely convert tensors and numpy types to JSON-serializable values."""
+        if torch is not None and isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return value.item()
+            return value.detach().cpu().tolist()
+
+        if hasattr(value, 'item') and callable(getattr(value, 'item')):
+            try:
+                return value.item()  # type: ignore[call-arg]
+            except (TypeError, ValueError):
+                pass
+
+        if isinstance(value, dict):
+            return {k: AlphaMetricsLogger._to_serializable(v) for k, v in value.items()}
+
+        if isinstance(value, (list, tuple)):
+            return [AlphaMetricsLogger._to_serializable(v) for v in value]
+
+        return value
 
     def get_latest_metrics(self, n: int = 100) -> list:
         """

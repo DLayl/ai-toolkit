@@ -157,29 +157,19 @@ class _BouncingLinearFn(torch.autograd.Function):
                 if w_fp_gpu.dtype != target_dtype:
                     w_fp_gpu = w_fp_gpu.to(target_dtype, non_blocking=True)
                 return w_fp_gpu
-            # float path: align to activation dtype for consistent math
+            # float path (preserve original behavior: NO dtype cast)
             w_gpu = cpu_w.to(dev, non_blocking=True)
-            if w_gpu.dtype != target_dtype and target_dtype in (
-                torch.bfloat16, torch.float16, torch.float32
-            ):
-                w_gpu = w_gpu.to(target_dtype, non_blocking=True)
             return w_gpu
 
         if device.type != "cuda":
-            x_cpu = x.to("cpu", dtype=target_dtype)
-            w_cpu = _materialize_linear_weight(weight_cpu, torch.device("cpu"))
-            b_cpu = None
-            if bias_cpu is not None:
-                b_cpu = bias_cpu.to("cpu")
-                if b_cpu.dtype != target_dtype and target_dtype in (
-                    torch.bfloat16, torch.float16, torch.float32
-                ):
-                    b_cpu = b_cpu.to(target_dtype)
-            out = F.linear(x_cpu, w_cpu, b_cpu)
+            out = F.linear(
+                x.to("cpu"),
+                _materialize_linear_weight(weight_cpu, torch.device("cpu")),
+                bias_cpu,
+            )
             ctx.save_for_backward(x.to("cpu"), weight_cpu, bias_cpu)
             ctx.device = torch.device("cpu")
-            ctx.target_dtype = target_dtype
-            return out.to(x.device, dtype=x.dtype)
+            return out.to(x.device)
 
         state = _get_device_state(device)
         ts = state["transfer_stream"]
@@ -191,15 +181,9 @@ class _BouncingLinearFn(torch.autograd.Function):
         with torch.cuda.stream(ts):
             ts.wait_event(ev_cu_s)
             w_bufs[idx] = _materialize_linear_weight(weight_cpu, device)
-            if bias_cpu is not None:
-                b_dev = bias_cpu.to(device, non_blocking=True)
-                if b_dev.dtype != target_dtype and target_dtype in (
-                    torch.bfloat16, torch.float16, torch.float32
-                ):
-                    b_dev = b_dev.to(target_dtype, non_blocking=True)
-                b_bufs[idx] = b_dev
-            else:
-                b_bufs[idx] = None
+            b_bufs[idx] = (
+                bias_cpu.to(device, non_blocking=True) if bias_cpu is not None else None
+            )
             state["forward_clk"] ^= 1
             ev_tx_f.record()
 
@@ -219,8 +203,8 @@ class _BouncingLinearFn(torch.autograd.Function):
         target_dtype = getattr(ctx, "target_dtype", grad_out.dtype)
 
         if device.type != "cuda":
-            go_cpu = grad_out.to("cpu", dtype=target_dtype)
-            x_cpu = x.to("cpu", dtype=target_dtype)
+            go_cpu = grad_out.to("cpu")
+            x_cpu = x.to("cpu")
             w_mat = (
                 weight_cpu.dequantize()
                 if _is_quantized_tensor(weight_cpu)
@@ -286,7 +270,9 @@ class _BouncingLinearFn(torch.autograd.Function):
         ev_cu_b_start.record()
 
         # grad wrt input (GPU)
-        grad_input = grad_out.to(dtype=target_dtype) @ w_bwd_buffers[idx]
+        weight_buf = w_bwd_buffers[idx]
+        grad_out_cast = grad_out.to(dtype=weight_buf.dtype)
+        grad_input = grad_out_cast @ weight_buf
 
         # ensure previous grad-to-CPU transfer that used this slot finished
         torch.cuda.current_stream().wait_event(ev_tx_w_bwd_done)
@@ -338,7 +324,7 @@ class _BouncingConv2dFn(torch.autograd.Function):
             else torch.bfloat16
         )
 
-        # GPU-side dequant/cast for quantized; float path alignment
+        # GPU-side dequant/cast for quantized; float path unchanged
         def _materialize_conv_weight(cpu_w, dev):
             if _is_quantized_tensor(cpu_w):
                 w_q_gpu = cpu_w.to(dev, non_blocking=True)
@@ -349,28 +335,15 @@ class _BouncingConv2dFn(torch.autograd.Function):
                 if w_fp_gpu.dtype != target_dtype:
                     w_fp_gpu = w_fp_gpu.to(target_dtype, non_blocking=True)
                 return w_fp_gpu
-            # float path: align dtype to activations for consistent math
+            # float path (preserve original behavior: NO dtype cast)
             w_gpu = cpu_w.to(dev, non_blocking=True)
-            if w_gpu.dtype != target_dtype and target_dtype in (
-                torch.bfloat16, torch.float16, torch.float32
-            ):
-                w_gpu = w_gpu.to(target_dtype, non_blocking=True)
             return w_gpu
 
         if device.type != "cuda":
-            x_cpu = x.to("cpu", dtype=target_dtype)
-            w_cpu = _materialize_conv_weight(weight_cpu, torch.device("cpu"))
-            b_cpu = None
-            if bias_cpu is not None:
-                b_cpu = bias_cpu.to("cpu")
-                if b_cpu.dtype != target_dtype and target_dtype in (
-                    torch.bfloat16, torch.float16, torch.float32
-                ):
-                    b_cpu = b_cpu.to(target_dtype)
             out = F.conv2d(
-                x_cpu,
-                w_cpu,
-                b_cpu,
+                x.to("cpu"),
+                _materialize_conv_weight(weight_cpu, torch.device("cpu")),
+                bias_cpu,
                 stride,
                 padding,
                 dilation,
@@ -378,7 +351,7 @@ class _BouncingConv2dFn(torch.autograd.Function):
             )
             ctx.save_for_backward(x.to("cpu"), weight_cpu, bias_cpu)
             ctx.meta = ("cpu", stride, padding, dilation, groups, target_dtype)
-            return out.to(x.device, dtype=x.dtype)
+            return out.to(x.device)
 
         state = _get_device_state(device)
         ts = state["transfer_stream"]
@@ -390,15 +363,9 @@ class _BouncingConv2dFn(torch.autograd.Function):
         with torch.cuda.stream(ts):
             ts.wait_event(ev_cu_s)
             w_bufs[idx] = _materialize_conv_weight(weight_cpu, device)
-            if bias_cpu is not None:
-                b_dev = bias_cpu.to(device, non_blocking=True)
-                if b_dev.dtype != target_dtype and target_dtype in (
-                    torch.bfloat16, torch.float16, torch.float32
-                ):
-                    b_dev = b_dev.to(target_dtype, non_blocking=True)
-                b_bufs[idx] = b_dev
-            else:
-                b_bufs[idx] = None
+            b_bufs[idx] = (
+                bias_cpu.to(device, non_blocking=True) if bias_cpu is not None else None
+            )
             state["forward_clk"] ^= 1
             ev_tx_f.record()
 
@@ -418,8 +385,8 @@ class _BouncingConv2dFn(torch.autograd.Function):
         if (
             isinstance(device, torch.device) and device.type != "cuda"
         ) or device == "cpu":
-            go = grad_out.to("cpu", dtype=target_dtype)
-            x_cpu = x.to("cpu", dtype=target_dtype)
+            go = grad_out.to("cpu")
+            x_cpu = x.to("cpu")
             w_cpu = (
                 weight_cpu.dequantize()
                 if _is_quantized_tensor(weight_cpu)
@@ -514,10 +481,12 @@ class _BouncingConv2dFn(torch.autograd.Function):
 
         from torch.nn.grad import conv2d_input, conv2d_weight  # type: ignore
 
+        weight_buf = w_bwd_buffers[idx]
+        grad_out_cast = grad_out.to(dtype=weight_buf.dtype)
         grad_input = conv2d_input(
             x.shape,
-            w_bwd_buffers[idx],
-            grad_out.to(dtype=target_dtype),
+            weight_buf,
+            grad_out_cast,
             stride=stride,
             padding=padding,
             dilation=dilation,

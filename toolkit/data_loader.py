@@ -570,6 +570,13 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 # handle cropping to a specific point of interest
                 # setup buckets every epoch
                 self.setup_buckets(quiet=True)
+            if (
+                self.is_caching_latents
+                and getattr(self.dataset_config, 'has_augmentations', False)
+                and getattr(self.dataset_config, 'augmentations_cache_mode', 'disable_cache') == 'refresh_each_epoch'
+            ):
+                self.dataset_config.augmentation_cache_epoch += 1
+                self.cache_latents_all_latents(force_refresh=True)
         self.epoch_num += 1
 
     def __len__(self):

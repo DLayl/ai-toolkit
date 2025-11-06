@@ -14,6 +14,76 @@ sys.path.insert(0, os.getcwd())
 # turn off diffusers telemetry until I can figure out how to make it opt-in
 os.environ['DISABLE_TELEMETRY'] = 'YES'
 
+
+def _ensure_cuda_runtime_loaded():
+    """Preload libcudart if it is packaged inside the Python environment.
+
+    Some bundled CUDA wheels ship the runtime under site-packages/nvidia/..., which
+    the dynamic loader does not scan by default. When flash-attn tries to import it
+    later we can proactively dlopen the shared object so it becomes available.
+    """
+
+    if os.name != 'posix' or os.environ.get('AITOOLKIT_SKIP_CUDA_RUNTIME_FIX') == '1':
+        return
+
+    import ctypes
+    import ctypes.util
+    from pathlib import Path
+
+    # If the runtime is already visible we can stop early.
+    if ctypes.util.find_library('cudart'):  # returns absolute path if visible
+        return
+
+    search_roots = set()
+
+    # Honour an explicit override first.
+    override = os.environ.get('AITOOLKIT_CUDA_RUNTIME_PATH')
+    if override:
+        search_roots.add(Path(override))
+
+    # Scan sys.path entries (site-packages, editable installs, etc.)
+    for entry in list(sys.path):
+        try:
+            path_obj = Path(entry)
+        except TypeError:
+            continue
+        # Add the entry and a couple of obvious parents that frequently host the libs.
+        search_roots.add(path_obj)
+        search_roots.add(path_obj.parent)
+
+    # Also look beneath the virtualenv prefix if present.
+    prefix = getattr(sys, 'prefix', None)
+    if prefix:
+        search_roots.add(Path(prefix))
+
+    libc_name = 'libcudart.so.13'
+
+    for root in search_roots:
+        if not root.exists():
+            continue
+        try:
+            matches = list(root.rglob(libc_name))
+        except OSError:
+            continue
+        for candidate in matches:
+            try:
+                ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
+                return
+            except OSError:
+                continue
+
+    # If we reach this point the runtime is still not visible; emit a gentle warning
+    # so users know why flash-attn may fail to load later.
+    if os.environ.get('AITOOLKIT_SUPPRESS_CUDA_RUNTIME_WARNING') != '1':
+        sys.stderr.write(
+            "[ai-toolkit] Warning: Could not locate libcudart.so.13 automatically. "
+            "If flash-attn import fails, install the CUDA runtime or set "
+            "AITOOLKIT_CUDA_RUNTIME_PATH to the directory containing libcudart.so.13.\n"
+        )
+
+
+_ensure_cuda_runtime_loaded()
+
 # check if we have DEBUG_TOOLKIT in env
 if os.environ.get("DEBUG_TOOLKIT", "0") == "1":
     # set torch to trace mode

@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import shutil
 from collections import OrderedDict
 from typing import TYPE_CHECKING, List, Dict, Union
 import traceback
@@ -15,6 +16,7 @@ import torch
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, SiglipImageProcessor
+from torch.utils.data import get_worker_info
 
 from toolkit.basic import flush, value_map
 from toolkit.buckets import get_bucket_for_image_size, get_resolution
@@ -40,6 +42,14 @@ if TYPE_CHECKING:
     from toolkit.stable_diffusion_model import StableDiffusion
 
 accelerator = get_accelerator()
+
+
+def _get_gh200_helpers():
+    try:
+        from toolkit import gh200_helpers  # type: ignore
+    except Exception:
+        return None
+    return gh200_helpers
 
 # def get_associated_caption_from_img_path(img_path):
 # https://demo.albumentations.ai/
@@ -519,16 +529,7 @@ class ImageProcessingDTOMixin:
                     
             # Final safety check - ensure no frame exceeds max valid index
             frames_to_extract = [min(frame_idx, max_frame_index) for frame_idx in frames_to_extract]
-
-            # Add temporal per-frame jitter (optional)
-            temporal_jitter = getattr(self.dataset_config, 'temporal_jitter', 0)
-            if temporal_jitter > 0 and len(frames_to_extract) > 0:
-                # Independent ±N jitter per index, clamped to valid range
-                frames_to_extract = [
-                    max(0, min(idx + random.randint(-temporal_jitter, temporal_jitter), max_frame_index))
-                    for idx in frames_to_extract
-                ]
-
+            
             # Only log frames to extract if in debug mode
             if hasattr(self.dataset_config, 'debug') and self.dataset_config.debug:
                 print_acc(f"  Frames to extract: {frames_to_extract}")
@@ -1676,6 +1677,17 @@ class LatentCachingFileItemDTOMixin:
             item["flip_y"] = True
         if self.dataset_config.num_frames > 1:
             item["num_frames"] = self.dataset_config.num_frames
+        if (
+            hasattr(self, 'dataset_config')
+            and self.dataset_config is not None
+            and getattr(self.dataset_config, 'has_augmentations', False)
+            and (self.dataset_config.cache_latents or self.dataset_config.cache_latents_to_disk)
+        ):
+            mode = getattr(self.dataset_config, 'augmentations_cache_mode', 'disable_cache')
+            if mode == 'refresh_each_epoch':
+                item["augmentation_cache_epoch"] = getattr(self.dataset_config, 'augmentation_cache_epoch', 0)
+            elif mode == 'static':
+                item["augmentation_cache_epoch"] = 0
         return item
 
     def get_latent_path(self: 'FileItemDTO', recalculate=False):
@@ -1701,20 +1713,39 @@ class LatentCachingFileItemDTOMixin:
                 # we are caching on disk, don't save in memory
                 self._encoded_latent = None
             else:
-                # move it back to cpu
-                self._encoded_latent = self._encoded_latent.to('cpu')
+                gh200_helpers = _get_gh200_helpers()
+                if gh200_helpers and gh200_helpers.gh200_uvm_enabled() and torch.cuda.is_available():
+                    if isinstance(self._encoded_latent, torch.Tensor) and self._encoded_latent.is_cuda:
+                        gh200_helpers.prefer_cpu_residency(self._encoded_latent)
+                else:
+                    # move it back to cpu
+                    self._encoded_latent = self._encoded_latent.to('cpu')
 
     def get_latent(self, device=None):
         if not self.is_latent_cached:
             return None
         if self._encoded_latent is None:
+            gh200_helpers = _get_gh200_helpers()
+            worker_info = get_worker_info()
+            in_worker = worker_info is not None
+            if (
+                gh200_helpers
+                and gh200_helpers.gh200_uvm_enabled()
+                and torch.cuda.is_available()
+                and not in_worker
+            ):
+                load_device = device if device is not None else self.latent_load_device
+            else:
+                load_device = 'cpu'
             # load it from disk
             state_dict = load_file(
                 self.get_latent_path(),
-                # device=device if device is not None else self.latent_load_device
-                device='cpu'
+                device=load_device
             )
             self._encoded_latent = state_dict['latent']
+            if gh200_helpers and gh200_helpers.gh200_uvm_enabled() and isinstance(self._encoded_latent, torch.Tensor):
+                if self._encoded_latent.is_cuda:
+                    gh200_helpers.prefer_cpu_residency(self._encoded_latent)
         return self._encoded_latent
 
 
@@ -1725,7 +1756,7 @@ class LatentCachingMixin:
             super().__init__(**kwargs)
         self.latent_cache = {}
 
-    def cache_latents_all_latents(self: 'AiToolkitDataset'):
+    def cache_latents_all_latents(self: 'AiToolkitDataset', force_refresh: bool = False):
         if self.dataset_config.num_frames > 1:
             raise Exception("Error: caching latents is not supported for multi-frame datasets")
         with accelerator.main_process_first():
@@ -1733,6 +1764,21 @@ class LatentCachingMixin:
             # cache all latents to disk
             to_disk = self.is_caching_latents_to_disk
             to_memory = self.is_caching_latents_to_memory
+            multi_worker_mode = bool(getattr(self.dataset_config, 'num_workers', 0) and self.dataset_config.num_workers > 0)
+
+            if force_refresh:
+                for file_item in self.file_list:
+                    file_item._encoded_latent = None
+                    file_item.is_latent_cached = False
+                    file_item._latent_path = None
+                if to_disk:
+                    latent_dirs = {
+                        os.path.join(os.path.dirname(file_item.path), '_latent_cache')
+                        for file_item in self.file_list
+                    }
+                    for latent_dir in latent_dirs:
+                        if os.path.isdir(latent_dir):
+                            shutil.rmtree(latent_dir)
 
             if to_disk:
                 print_acc(" - Saving latents to disk")
@@ -1761,17 +1807,41 @@ class LatentCachingMixin:
                     file_item.latent_space_version = self.sd.model_config.arch
                 file_item.is_caching_to_disk = to_disk
                 file_item.is_caching_to_memory = to_memory
-                file_item.latent_load_device = self.sd.device
+                file_item.latent_load_device = 'cpu' if multi_worker_mode else self.sd.device
 
+                gh200_helpers = _get_gh200_helpers()
                 latent_path = file_item.get_latent_path(recalculate=True)
-                # check if it is saved to disk already
                 if os.path.exists(latent_path):
-                    if to_memory:
-                        # load it into memory
+                    load_device = file_item.latent_load_device
+                    if isinstance(load_device, str):
+                        if load_device == 'cuda':
+                            load_device = 'cuda:0'
+                        elif load_device.startswith('cuda') and not torch.cuda.is_available():
+                            load_device = 'cpu'
+                    elif isinstance(load_device, torch.device):
+                        if load_device.type == 'cuda':
+                            index = 0 if load_device.index is None else load_device.index
+                            load_device = f'cuda:{index}'
+                            if not torch.cuda.is_available():
+                                load_device = 'cpu'
+                        else:
+                            load_device = load_device.type
+                    if (
+                        gh200_helpers
+                        and gh200_helpers.gh200_uvm_enabled()
+                        and torch.cuda.is_available()
+                        and str(load_device).startswith('cuda')
+                        and not multi_worker_mode
+                    ):
+                        state_dict = load_file(latent_path, device=load_device)
+                        latent_tensor = state_dict['latent']
+                        if latent_tensor.is_cuda:
+                            gh200_helpers.prefer_cpu_residency(latent_tensor)
+                        file_item._encoded_latent = latent_tensor
+                    else:
                         state_dict = load_file(latent_path, device='cpu')
                         file_item._encoded_latent = state_dict['latent'].to('cpu', dtype=self.sd.torch_dtype)
                 else:
-                    # not saved to disk, calculate
                     # load the image first
                     file_item.load_and_process_image(self.transform, only_load_latents=True)
                     dtype = self.sd.torch_dtype
@@ -1780,6 +1850,9 @@ class LatentCachingMixin:
                     try:
                         imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
                         latent = self.sd.encode_images(imgs).squeeze(0)
+                        gh200_helpers = _get_gh200_helpers()
+                        if gh200_helpers and gh200_helpers.gh200_uvm_enabled() and latent.is_cuda:
+                            gh200_helpers.prefer_cpu_residency(latent)
                     except Exception as e:
                         print_acc(f"Error processing image: {file_item.path}")
                         print_acc(f"Error: {str(e)}")
@@ -1795,8 +1868,17 @@ class LatentCachingMixin:
                         save_file(state_dict, latent_path, metadata=meta)
 
                     if to_memory:
-                        # keep it in memory
-                        file_item._encoded_latent = latent.to('cpu', dtype=self.sd.torch_dtype)
+                        gh200_helpers = _get_gh200_helpers()
+                        if (
+                            gh200_helpers
+                            and gh200_helpers.gh200_uvm_enabled()
+                            and latent.is_cuda
+                            and not multi_worker_mode
+                        ):
+                            file_item._encoded_latent = latent.detach()
+                            gh200_helpers.prefer_cpu_residency(file_item._encoded_latent)
+                        else:
+                            file_item._encoded_latent = latent.to('cpu', dtype=self.sd.torch_dtype)
 
                     del imgs
                     del latent
@@ -1866,8 +1948,19 @@ class TextEmbeddingFileItemDTOMixin:
         if not self.is_text_embedding_cached:
             return
         if self.prompt_embeds is None:
+            gh200_helpers = _get_gh200_helpers()
+            load_device = None
+            worker_info = get_worker_info()
+            in_worker = worker_info is not None
+            if (
+                gh200_helpers
+                and gh200_helpers.gh200_uvm_enabled()
+                and torch.cuda.is_available()
+                and not in_worker
+            ):
+                load_device = device if device is not None else self.text_embedding_load_device
             # load it from disk
-            self.prompt_embeds = PromptEmbeds.load(self.get_text_embedding_path())
+            self.prompt_embeds = PromptEmbeds.load(self.get_text_embedding_path(), device=load_device)
 
 class TextEmbeddingCachingMixin:
     def __init__(self: 'AiToolkitDataset', **kwargs):
@@ -1885,9 +1978,11 @@ class TextEmbeddingCachingMixin:
 
             # use tqdm to show progress
             i = 0
+            multi_worker_mode = bool(getattr(self.dataset_config, 'num_workers', 0) and self.dataset_config.num_workers > 0)
             for file_item in tqdm(self.file_list, desc='Caching text embeddings to disk'):
                 file_item.text_embedding_space_version = self.sd.model_config.arch
-                file_item.latent_load_device = self.sd.device
+                file_item.latent_load_device = 'cpu' if multi_worker_mode else self.sd.device
+                file_item.text_embedding_load_device = 'cpu' if multi_worker_mode else self.sd.device
 
                 text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
                 # only process if not saved to disk
@@ -1928,6 +2023,9 @@ class TextEmbeddingCachingMixin:
                         prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption, control_images=ctrl_img)
                     else:
                         prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption)
+                    gh200_helpers = _get_gh200_helpers()
+                    if gh200_helpers and gh200_helpers.gh200_uvm_enabled():
+                        gh200_helpers.optimize_batch_for_gh200({"prompt_embeds": prompt_embeds})
                     # save it
                     prompt_embeds.save(text_embedding_path)
                     del prompt_embeds

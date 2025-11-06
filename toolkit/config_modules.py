@@ -547,6 +547,7 @@ class TrainConfig:
         # contrastive loss
         self.do_guidance_loss = kwargs.get('do_guidance_loss', False)
         self.guidance_loss_target: Union[int, List[int, int]] = kwargs.get('guidance_loss_target', 3.0)
+        self.do_guidance_loss_cfg_zero: bool = kwargs.get('do_guidance_loss_cfg_zero', False)
         self.unconditional_prompt: str = kwargs.get('unconditional_prompt', '')
         if isinstance(self.guidance_loss_target, tuple):
             self.guidance_loss_target = list(self.guidance_loss_target)
@@ -915,11 +916,30 @@ class DatasetConfig:
         self.shuffle_augmentations: bool = kwargs.get('shuffle_augmentations', False)
 
         has_augmentations = self.augmentations is not None and len(self.augmentations) > 0
+        self.has_augmentations = has_augmentations
 
-        if (len(self.augments) > 0 or has_augmentations) and (self.cache_latents or self.cache_latents_to_disk):
+        # control how augmentations interact with latent caching
+        self.augmentations_cache_mode: str = kwargs.get('augmentations_cache_mode', 'disable_cache')
+        if self.augmentations_cache_mode not in {"disable_cache", "static", "refresh_each_epoch"}:
+            raise ValueError(
+                "augmentations_cache_mode must be one of 'disable_cache', 'static', or 'refresh_each_epoch'"
+            )
+
+        self.augmentation_cache_epoch: int = 0
+
+        if len(self.augments) > 0 and (self.cache_latents or self.cache_latents_to_disk):
             print(f"WARNING: Augments are not supported with caching latents. Setting cache_latents to False")
             self.cache_latents = False
             self.cache_latents_to_disk = False
+        elif has_augmentations and (self.cache_latents or self.cache_latents_to_disk):
+            if self.augmentations_cache_mode == 'disable_cache':
+                print(f"WARNING: Augments are not supported with caching latents. Setting cache_latents to False")
+                self.cache_latents = False
+                self.cache_latents_to_disk = False
+            elif self.augmentations_cache_mode == 'static':
+                print(f"INFO: Augmentations will be cached once per item; randomness will not change after caching.")
+            elif self.augmentations_cache_mode == 'refresh_each_epoch':
+                print(f"INFO: Augmentations will refresh cached latents each epoch. Expect longer epoch setup time.")
 
         # legacy compatability
         legacy_caption_type = kwargs.get('caption_type', None)
@@ -956,12 +976,7 @@ class DatasetConfig:
         # this could have various issues with shorter videos and videos with variable fps
         # I recommend trimming your videos to the desired length and using shrink_video_to_frames(default)
         self.fps: int = kwargs.get('fps', 16)
-
-        # temporal jitter for video frames - adds ±N frame randomness to each frame index
-        # helps prevent temporal overfitting by introducing micro-variations in frame selection
-        # use values of 1-2 for early/mid training, disable (0) for finisher phase
-        self.temporal_jitter: int = kwargs.get('temporal_jitter', 0)
-
+        
         # debug the frame count and frame selection. You dont need this. It is for debugging.
         self.debug: bool = kwargs.get('debug', False)
         

@@ -129,13 +129,14 @@ class PromptEmbeds:
         save_file(state_dict, path)
     
     @classmethod
-    def load(cls, path: str) -> 'PromptEmbeds':
+    def load(cls, path: str, device: str = 'cpu') -> 'PromptEmbeds':
         """
         Load the prompt embeds from a file.
         :param path: The path to load the prompt embeds from.
+        :param device: Device to load tensors to (default: 'cpu')
         :return: An instance of PromptEmbeds.
         """
-        state_dict = load_file(path, device='cpu')
+        state_dict = load_file(path, device=device if device is not None else 'cpu')
         text_embeds = []
         pooled_embeds = None
         attention_mask = []

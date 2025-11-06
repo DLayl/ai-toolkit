@@ -45,6 +45,7 @@ from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.sampler import get_sampler
 from toolkit.saving import save_t2i_from_diffusers, load_t2i_model, save_ip_adapter_from_diffusers, \
     load_ip_adapter_model, load_custom_adapter_model
+from toolkit import gh200_helpers
 
 from toolkit.scheduler import get_lr_scheduler
 from toolkit.sd_device_states_presets import get_train_sd_device_state_preset
@@ -120,6 +121,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         self.save_config = SaveConfig(**self.get_conf('save', {}))
         self.sample_config = SampleConfig(**self.get_conf('sample', {}))
+        if len(self.sample_config.prompts) == 0:
+            validation_conf = self.get_conf('validation', None)
+            if validation_conf is not None:
+                print_acc("[INFO] No prompts found in 'sample' config. Using 'validation' block for sampling.")
+                self.sample_config = SampleConfig(**validation_conf)
         first_sample_config = self.get_conf('first_sample', None)
         if first_sample_config is not None:
             self.has_first_sample_requested = True
@@ -283,9 +289,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
             return
         flush()
         sample_folder = os.path.join(self.save_root, 'samples')
+        os.makedirs(sample_folder, exist_ok=True)
         gen_img_config_list = []
 
         sample_config = self.first_sample_config if is_first else self.sample_config
+        if len(sample_config.prompts) == 0:
+            validation_conf = self.get_conf('validation', None)
+            if validation_conf is not None:
+                print_acc("[INFO] No prompts available for sampling; falling back to 'validation' configuration.")
+                sample_config = SampleConfig(**validation_conf)
+                if is_first:
+                    self.first_sample_config = sample_config
+                else:
+                    self.sample_config = sample_config
+            else:
+                print_acc("[WARN] Skipping sampling: no prompts defined in 'sample' or 'validation' configs.")
+                return
         start_seed = sample_config.seed
         current_seed = start_seed
 
@@ -880,24 +899,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if hasattr(self.network, 'alpha_scheduler') and self.network.alpha_scheduler is not None:
                 import json
                 scheduler_file = path.replace('.safetensors', '_alpha_scheduler.json')
-                # For MoE models, strip expert suffix (_high_noise, _low_noise) since scheduler is shared
-                scheduler_file = scheduler_file.replace('_high_noise_alpha_scheduler.json', '_alpha_scheduler.json')
-                scheduler_file = scheduler_file.replace('_low_noise_alpha_scheduler.json', '_alpha_scheduler.json')
-                print_acc(f"[DEBUG] Looking for alpha scheduler at: {scheduler_file}")
                 if os.path.exists(scheduler_file):
                     try:
                         with open(scheduler_file, 'r') as f:
                             scheduler_state = json.load(f)
-                        print_acc(f"[DEBUG] Loaded state: steps_in_phase={scheduler_state.get('steps_in_phase')}, total_steps={scheduler_state.get('total_steps')}")
                         self.network.alpha_scheduler.load_state_dict(scheduler_state)
-                        print_acc(f"✓ Loaded alpha scheduler state from {scheduler_file}")
-                        print_acc(f"  steps_in_phase={self.network.alpha_scheduler.steps_in_phase}, total_steps={self.network.alpha_scheduler.total_steps}")
+                        print_acc(f"Loaded alpha scheduler state from {scheduler_file}")
                     except Exception as e:
-                        print_acc(f"✗ WARNING: Failed to load alpha scheduler state: {e}")
-                        import traceback
-                        traceback.print_exc()
-                else:
-                    print_acc(f"[DEBUG] Alpha scheduler file not found: {scheduler_file}")
+                        print_acc(f"Warning: Failed to load alpha scheduler state: {e}")
 
             self.load_training_state_from_metadata(path)
             return extra_weights
@@ -1046,6 +1055,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
     def process_general_training_batch(self, batch: 'DataLoaderBatchDTO'):
         with torch.no_grad():
+            if gh200_helpers.gh200_uvm_enabled():
+                gh200_helpers.optimize_batch_for_gh200(batch)
             with self.timer('prepare_prompt'):
                 prompts = batch.get_caption_list()
                 is_reg_list = batch.get_is_reg_list()
@@ -1682,53 +1693,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         #         for block in model.single_transformer_blocks:
         #             processor = FluxSageAttnProcessor2_0()
         #             block.attn.set_processor(processor)
-
+                    
         #     except ImportError:
         #         print_acc("sage attention is not installed. Using SDP instead")
-
-        # Enable SageAttention for Wan models (2-3x speedup on attention)
-        if hasattr(self.sd, 'arch') and 'wan' in str(self.sd.arch):
-            try:
-                from sageattention import sageattn
-                from toolkit.models.wan_sage_attn import WanSageAttnProcessor2_0
-                from diffusers import WanTransformer3DModel
-                from extensions_built_in.diffusion_models.wan22.wan22_14b_model import DualWanTransformer3DModel
-
-                print_acc("Enabling SageAttention for Wan model...")
-
-                processor_count = 0
-                # Handle both single and dual transformer setups
-                if isinstance(self.sd.unet, DualWanTransformer3DModel):
-                    # Wan 2.2 14B has dual transformers
-                    for transformer_name, transformer in [('transformer_1', self.sd.unet.transformer_1),
-                                                          ('transformer_2', self.sd.unet.transformer_2)]:
-                        if hasattr(transformer, 'blocks'):
-                            for block in transformer.blocks:
-                                # Wan blocks have attn1 and attn2
-                                for attn_name in ['attn1', 'attn2']:
-                                    if hasattr(block, attn_name):
-                                        attn = getattr(block, attn_name)
-                                        if hasattr(attn, 'set_processor'):
-                                            processor = WanSageAttnProcessor2_0()
-                                            attn.set_processor(processor)
-                                            processor_count += 1
-                    print_acc(f"SageAttention enabled on {processor_count} attention layers in DualWanTransformer3DModel")
-                elif isinstance(self.sd.unet, WanTransformer3DModel):
-                    # Single transformer Wan models
-                    if hasattr(self.sd.unet, 'blocks'):
-                        for block in self.sd.unet.blocks:
-                            # Wan blocks have attn1 and attn2
-                            for attn_name in ['attn1', 'attn2']:
-                                if hasattr(block, attn_name):
-                                    attn = getattr(block, attn_name)
-                                    if hasattr(attn, 'set_processor'):
-                                        processor = WanSageAttnProcessor2_0()
-                                        attn.set_processor(processor)
-                                        processor_count += 1
-                        print_acc(f"SageAttention enabled on {processor_count} attention layers in WanTransformer3DModel")
-
-            except ImportError as e:
-                print_acc(f"SageAttention not available: {e}. Using standard attention instead.")
 
         if self.train_config.gradient_checkpointing:
             # if has method enable_gradient_checkpointing
@@ -2059,8 +2026,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         optimizer_state_filename = f'optimizer.pt'
         optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
         if os.path.exists(optimizer_state_file_path):
-            # Save automagic-specific params from current config BEFORE loading
-            # These will be reapplied after loading to ensure config changes take effect
+            # Capture Automagic per-group settings before loading so config changes persist
             config_param_settings = []
             for group in optimizer.param_groups:
                 config_param_settings.append({
@@ -2087,14 +2053,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"Failed to load optimizer state from {optimizer_state_file_path}")
                     print_acc(e)
 
-            # Reapply automagic-specific params from current config
-            # This ensures updated min_lr/max_lr/lr_bump values take effect
-            # BUT we DO NOT overwrite the 'lr' field - that should come from the loaded checkpoint
-            print_acc(f"Updating optimizer min_lr/max_lr/lr_bump from config")
+            print_acc("Updating optimizer min_lr/max_lr/lr_bump from config")
             if len(config_param_settings) > 0:
                 for i, group in enumerate(optimizer.param_groups):
-                    # DO NOT overwrite group['lr'] - it should come from the checkpoint
-                    # Only update the config-driven parameters
+                    if i >= len(config_param_settings):
+                        break
                     if config_param_settings[i]['min_lr'] is not None:
                         group['min_lr'] = config_param_settings[i]['min_lr']
                     if config_param_settings[i]['max_lr'] is not None:
@@ -2102,58 +2065,40 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if config_param_settings[i]['lr_bump'] is not None:
                         group['lr_bump'] = config_param_settings[i]['lr_bump']
 
-                # Clamp lr_mask values in optimizer state to respect new min_lr/max_lr bounds
-                # This handles case where config's min_lr/max_lr changed since checkpoint was saved
-                for group_idx, group in enumerate(optimizer.param_groups):
+                for group in optimizer.param_groups:
                     group_min_lr = group.get('min_lr')
                     group_max_lr = group.get('max_lr')
-                    if group_min_lr is not None or group_max_lr is not None:
-                        for param in group['params']:
-                            if param in optimizer.state:
-                                param_state = optimizer.state[param]
-                                if 'lr_mask' in param_state:
-                                    # lr_mask might be Auto8bitTensor, extract the actual tensor
-                                    lr_mask = param_state['lr_mask']
+                    if group_min_lr is None and group_max_lr is None:
+                        continue
+                    for param in group['params']:
+                        if param not in optimizer.state:
+                            continue
+                        param_state = optimizer.state[param]
+                        if 'lr_mask' not in param_state:
+                            continue
+                        lr_mask = param_state['lr_mask']
+                        # Skip quantized tensors/Auto8bitTensor wrappers; they'll be clamped on next step
+                        if isinstance(lr_mask, dict) and 'quantized' in lr_mask:
+                            continue
+                        if hasattr(lr_mask, 'dequantize') or type(lr_mask).__name__ == 'Auto8bitTensor':
+                            continue
+                        if hasattr(lr_mask, 'data'):
+                            lr_mask_tensor = lr_mask.data
+                        else:
+                            lr_mask_tensor = lr_mask
+                        if group_min_lr is not None:
+                            lr_mask_tensor.clamp_(min=group_min_lr)
+                        if group_max_lr is not None:
+                            lr_mask_tensor.clamp_(max=group_max_lr)
+                        param_state['avg_lr'] = torch.mean(lr_mask_tensor)
 
-                                    # Skip clamping for Auto8bitTensor and quantized tensors - will be clamped on first step
-                                    if isinstance(lr_mask, dict) and 'quantized' in lr_mask:
-                                        continue
-                                    elif hasattr(lr_mask, 'dequantize') or type(lr_mask).__name__ == 'Auto8bitTensor':
-                                        # This is an Auto8bitTensor object
-                                        continue
-                                    elif hasattr(lr_mask, 'data'):
-                                        lr_mask_tensor = lr_mask.data
-                                    else:
-                                        lr_mask_tensor = lr_mask
-
-                                    # Clamp to new bounds
-                                    if group_min_lr is not None:
-                                        lr_mask_tensor.clamp_(min=group_min_lr)
-                                    if group_max_lr is not None:
-                                        lr_mask_tensor.clamp_(max=group_max_lr)
-
-                                    # Update avg_lr
-                                    param_state['avg_lr'] = torch.mean(lr_mask_tensor)
-
-                print_acc(f"✓ Clamped lr_mask values to config's min_lr/max_lr bounds")
-
-            # Update the learning rates if they changed
-            # optimizer.param_groups = previous_params
+                print_acc("\u2713 Clamped lr_mask values to config's min_lr/max_lr bounds")
 
         lr_scheduler_params = self.train_config.lr_scheduler_params
 
         # make sure it had bare minimum
         if 'max_iterations' not in lr_scheduler_params:
-            # Adjust total_iters to account for gradient accumulation
-            # The scheduler should step once per optimizer step, not per training iteration
-            gradient_accumulation_steps = max(1, self.train_config.gradient_accumulation_steps)
-            if gradient_accumulation_steps == -1:
-                # -1 means accumulate for entire epoch, difficult to predict step count
-                # Use total steps as fallback (will step more frequently than ideal)
-                lr_scheduler_params['total_iters'] = self.train_config.steps
-            else:
-                # Calculate actual number of optimizer steps
-                lr_scheduler_params['total_iters'] = self.train_config.steps // gradient_accumulation_steps
+            lr_scheduler_params['total_iters'] = self.train_config.steps
 
         lr_scheduler = get_lr_scheduler(
             self.train_config.lr_scheduler,
@@ -2232,8 +2177,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         ###################################################################
         # TRAIN LOOP
         ###################################################################
-        # When resuming, start from next step (checkpoint step is already complete)
-        start_step_num = self.step_num if self.step_num == 0 else self.step_num + 1
 
         # Realign multistage boundary state when resuming from checkpoint
         if getattr(self.sd, 'is_multistage', False) and hasattr(self.sd, 'multistage_boundaries'):
@@ -2274,6 +2217,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc(f"  Boundary index: {self.current_boundary_index} ({self.current_expert_name})")
                 print_acc(f"  Steps in boundary: {self.steps_this_boundary}/{self.train_config.switch_boundary_every}")
 
+        start_step_num = self.step_num
         did_first_flush = False
         flush_next = False
         for step in range(start_step_num, self.train_config.steps):

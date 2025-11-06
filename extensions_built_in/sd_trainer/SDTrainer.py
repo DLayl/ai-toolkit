@@ -10,7 +10,7 @@ import torch.functional as F
 from safetensors.torch import load_file
 from torch.utils.data import DataLoader, ConcatDataset
 
-from toolkit import train_tools
+from toolkit import gh200_helpers, train_tools
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.config_modules import GenerateImageConfig
@@ -709,23 +709,19 @@ class SDTrainer(BaseSDTrainProcess):
                     unconditional_embeds=None,
                     batch=batch,
                 )
+
                 is_video = len(target.shape) == 5
 
                 if self.train_config.do_guidance_loss_cfg_zero:
-                    # zero cfg
+                    # zero cfg optional target
                     # ref https://github.com/WeichenFan/CFG-Zero-star/blob/cdac25559e3f16cb95f0016c04c709ea1ab9452b/wan_pipeline.py#L557
                     batch_size = target.shape[0]
                     positive_flat = target.view(batch_size, -1)
                     negative_flat = unconditional_target.view(batch_size, -1)
-                    # Calculate dot production
                     dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
-                    # Squared norm of uncondition
                     squared_norm = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
-                    # st_star = v_cond^T * v_uncond / ||v_uncond||^2
                     st_star = dot_product / squared_norm
-
                     alpha = st_star
-
                     alpha = alpha.view(batch_size, 1, 1, 1) if not is_video else alpha.view(batch_size, 1, 1, 1, 1)
                 else:
                     alpha = 1.0
@@ -1246,6 +1242,8 @@ class SDTrainer(BaseSDTrainProcess):
                     self.sd.text_encoder.to(self.sd.te_torch_dtype)
 
             noisy_latents, noise, timesteps, conditioned_prompts, imgs = self.process_general_training_batch(batch)
+            if gh200_helpers.gh200_uvm_enabled():
+                gh200_helpers.optimize_batch_for_gh200(batch)
             if self.train_config.do_cfg or self.train_config.do_random_cfg:
                 # pick random negative prompts
                 if self.negative_prompt_pool is not None:
@@ -1333,9 +1331,8 @@ class SDTrainer(BaseSDTrainProcess):
             mask_multiplier = torch.ones((noisy_latents.shape[0], 1, 1, 1), device=self.device_torch, dtype=dtype)
             if batch.mask_tensor is not None:
                 with self.timer('get_mask_multiplier'):
-                    # FIXED: BF16 interpolation is fully supported in modern PyTorch (2.0+)
-                    # Previous FP16 hardcoding caused precision loss and gradient instability
-                    mask_multiplier = batch.mask_tensor.to(self.device_torch, dtype=dtype).detach()
+                    # upsampling no supported for bfloat16
+                    mask_multiplier = batch.mask_tensor.to(self.device_torch, dtype=torch.float16).detach()
                     # scale down to the size of the latents, mask multiplier shape(bs, 1, width, height), noisy_latents shape(bs, channels, width, height)
                     if len(noisy_latents.shape) == 5:
                         # video B,C,T,H,W
@@ -1349,6 +1346,7 @@ class SDTrainer(BaseSDTrainProcess):
                     )
                     # expand to match latents
                     mask_multiplier = mask_multiplier.expand(-1, noisy_latents.shape[1], -1, -1)
+                    mask_multiplier = mask_multiplier.to(self.device_torch, dtype=dtype).detach()
                     # make avg 1.0
                     mask_multiplier = mask_multiplier / mask_multiplier.mean()
 
@@ -1623,7 +1621,12 @@ class SDTrainer(BaseSDTrainProcess):
                         conditional_embeds = conditional_embeds.detach()
                         if self.train_config.do_cfg:
                             unconditional_embeds = unconditional_embeds.detach()
-                    
+                    if gh200_helpers.gh200_uvm_enabled():
+                        gh200_helpers.optimize_batch_for_gh200({
+                            "prompt_embeds": conditional_embeds,
+                            "unconditional_prompt_embeds": unconditional_embeds,
+                        })
+
                     if self.decorator:
                         conditional_embeds.text_embeds = self.decorator(
                             conditional_embeds.text_embeds
@@ -2068,7 +2071,6 @@ class SDTrainer(BaseSDTrainProcess):
             if self.sd.is_multistage:
                 # handle multistage switching
                 if self.steps_this_boundary >= self.train_config.switch_boundary_every or self.current_boundary_index not in self.sd.trainable_multistage_boundaries:
-                    old_expert = self.current_expert_name
                     # iterate to make sure we only train trainable_multistage_boundaries
                     while True:
                         self.steps_this_boundary = 0
@@ -2078,18 +2080,6 @@ class SDTrainer(BaseSDTrainProcess):
                         if self.current_boundary_index in self.sd.trainable_multistage_boundaries:
                             # if this boundary is trainable, we can stop looking
                             break
-
-                    # Set current expert name for metrics tracking
-                    if self.current_boundary_index == 0:
-                        self.current_expert_name = 'high_noise'
-                    elif self.current_boundary_index == 1:
-                        self.current_expert_name = 'low_noise'
-                    else:
-                        self.current_expert_name = f'expert_{self.current_boundary_index}'
-
-                    # Log boundary switches for debugging
-                    if self.step_num % 100 == 0:  # Only log at boundary switches
-                        print_acc(f"  → Switched expert: {old_expert} → {self.current_expert_name} (step {self.step_num})")
             loss = self.train_single_accumulation(batch)
             self.steps_this_boundary += 1
             if total_loss is None:
@@ -2122,14 +2112,13 @@ class SDTrainer(BaseSDTrainProcess):
             if self.ema is not None:
                 with self.timer('ema_update'):
                     self.ema.update()
-
-            # Step LR scheduler only when optimizer steps (not during gradient accumulation)
-            # Scheduler total_iters is adjusted for gradient accumulation in BaseSDTrainProcess
-            with self.timer('scheduler_step'):
-                self.lr_scheduler.step()
         else:
             # gradient accumulation. Just a place for breakpoint
             pass
+
+        # TODO Should we only step scheduler on grad step? If so, need to recalculate last step
+        with self.timer('scheduler_step'):
+            self.lr_scheduler.step()
 
         if self.embedding is not None:
             with self.timer('restore_embeddings'):
