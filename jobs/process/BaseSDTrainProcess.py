@@ -2178,6 +2178,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # TRAIN LOOP
         ###################################################################
 
+        start_step_num = self.step_num
+
         # Realign multistage boundary state when resuming from checkpoint
         if getattr(self.sd, 'is_multistage', False) and hasattr(self.sd, 'multistage_boundaries'):
             total_boundaries = len(self.sd.multistage_boundaries)
@@ -2217,7 +2219,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc(f"  Boundary index: {self.current_boundary_index} ({self.current_expert_name})")
                 print_acc(f"  Steps in boundary: {self.steps_this_boundary}/{self.train_config.switch_boundary_every}")
 
-        start_step_num = self.step_num
         did_first_flush = False
         flush_next = False
         for step in range(start_step_num, self.train_config.steps):
