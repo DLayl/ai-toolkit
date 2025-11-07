@@ -464,14 +464,43 @@ class Wan2214bModel(Wan21):
         only_train_high_noise = self.train_high_noise and not self.train_low_noise
         only_train_low_noise = self.train_low_noise and not self.train_high_noise
 
+        def _matches_stage(original_key: str, stage: int) -> bool:
+            stage_tokens = (
+                f".transformer_{stage}.",
+                f".transformer{stage}.",
+                f"lycoris_transformer_{stage}_",
+                f"lycoris_transformer{stage}_",
+                f"transformer_{stage}_",
+                f"transformer{stage}_",
+            )
+            return any(token in original_key for token in stage_tokens)
+
+        def _strip_stage_tokens(original_key: str, stage: int) -> str:
+            replacements = (
+                (f".transformer_{stage}.", "."),
+                (f".transformer{stage}.", "."),
+                (f"lycoris_transformer_{stage}_", "lycoris_"),
+                (f"lycoris_transformer{stage}_", "lycoris_"),
+                (f"transformer_{stage}_", ""),
+                (f"transformer{stage}_", ""),
+            )
+            new_key = original_key
+            for old, new in replacements:
+                new_key = new_key.replace(old, new)
+            while ".." in new_key:
+                new_key = new_key.replace("..", ".")
+            while "__" in new_key:
+                new_key = new_key.replace("__", "_")
+            return new_key
+
         for key in state_dict:
-            if ".transformer_1." in key or only_train_high_noise:
+            if _matches_stage(key, 1) or only_train_high_noise:
                 # this is a high noise LoRA
-                new_key = key.replace(".transformer_1.", ".")
+                new_key = _strip_stage_tokens(key, 1)
                 high_noise_lora[new_key] = state_dict[key]
-            elif ".transformer_2." in key or only_train_low_noise:
+            elif _matches_stage(key, 2) or only_train_low_noise:
                 # this is a low noise LoRA
-                new_key = key.replace(".transformer_2.", ".")
+                new_key = _strip_stage_tokens(key, 2)
                 low_noise_lora[new_key] = state_dict[key]
 
         # loras have either LORA_MODEL_NAME_000005000.safetensors or LORA_MODEL_NAME.safetensors

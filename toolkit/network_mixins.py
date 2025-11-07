@@ -570,6 +570,11 @@ class ToolkitNetworkMixin:
                 # lora_transformer_transformer_blocks_7_attn_to_v.lokr_w1 to lycoris_transformer_blocks_7_attn_to_v.lokr_w1
                 new_key = key
                 new_key = new_key.replace('lora_transformer_', 'lycoris_')
+                new_key = new_key.replace('lora_conv_', 'lycoris_conv_')
+                new_key = new_key.replace('lora_linear_', 'lycoris_linear_')
+                new_key = new_key.replace('lora_transformer1_', 'lycoris_transformer_1_')
+                new_key = new_key.replace('lora_transformer2_', 'lycoris_transformer_2_')
+                new_key = new_key.replace('$$', '.')
                 new_save_dict[new_key] = value
 
             save_dict = new_save_dict
