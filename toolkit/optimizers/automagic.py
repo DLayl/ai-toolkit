@@ -3,6 +3,7 @@ import torch
 from toolkit.optimizers.optimizer_utils import Auto8bitTensor, copy_stochastic, stochastic_grad_accummulation
 from optimum.quanto import QBytesTensor
 import random
+import math
 
 
 class Automagic(torch.optim.Optimizer):
@@ -90,6 +91,10 @@ class Automagic(torch.optim.Optimizer):
                 self._total_paramiter_size += torch.numel(param)
         # pretty print total paramiters with comma seperation
         print(f"Total training paramiters: {self._total_paramiter_size:,}")
+
+        # Track gradient stability & recent losses for alpha scheduler exit criteria
+        self._gradient_sign_agreements: List[float] = []
+        self.recent_losses: List[float] = []
 
         # needs to be enabled to count paramiters
         if self.do_paramiter_swapping:
@@ -190,6 +195,16 @@ class Automagic(torch.optim.Optimizer):
         loss = None
         if closure is not None:
             loss = closure()
+
+        if loss is not None:
+            loss_value = loss.item() if torch.is_tensor(loss) else float(loss)
+            if math.isfinite(loss_value):
+                self.recent_losses.append(loss_value)
+                if len(self.recent_losses) > 1000:
+                    self.recent_losses.pop(0)
+
+        step_agreement_sum = 0.0
+        step_agreement_weight = 0.0
 
         for group in self.param_groups:
             for p in group["params"]:
@@ -303,6 +318,11 @@ class Automagic(torch.optim.Optimizer):
                 state['lr_mask'] = Auto8bitTensor(new_lr)
                 state['avg_lr'] = torch.mean(new_lr)
 
+                agreement_rate = (sign_agreement > 0).float().mean().item()
+                weight = float(p.numel())
+                step_agreement_sum += agreement_rate * weight
+                step_agreement_weight += weight
+
                 if group["weight_decay"] != 0:
                     # Apply weight decay with per-parameter learning rates
                     # Instead of using add_ with a tensor alpha (which isn't supported),
@@ -315,6 +335,12 @@ class Automagic(torch.optim.Optimizer):
                 if p.dtype != torch.float32:
                     # apply stochastic rounding
                     copy_stochastic(p, p_data_fp32)
+
+        if step_agreement_weight > 0:
+            overall_agreement = step_agreement_sum / step_agreement_weight
+            self._gradient_sign_agreements.append(overall_agreement)
+            if len(self._gradient_sign_agreements) > 1000:
+                self._gradient_sign_agreements.pop(0)
 
         return loss
     
@@ -362,10 +388,15 @@ class Automagic(torch.optim.Optimizer):
             new_sace_state[p] = save_state
             
         orig_state_dict['state'] = new_sace_state
+        orig_state_dict['gradient_sign_agreements'] = list(self._gradient_sign_agreements)
+        orig_state_dict['recent_losses'] = list(self.recent_losses)
         
         return orig_state_dict
     
     def load_state_dict(self, state_dict, strict=True):
+        grad_history = state_dict.pop('gradient_sign_agreements', None)
+        loss_history = state_dict.pop('recent_losses', None)
+
         # Validate that the state_dict is from an Automagic optimizer
         is_valid_automagic_state = False
         
@@ -461,17 +492,19 @@ class Automagic(torch.optim.Optimizer):
                     current_param.shape).to(current_param.device, dtype=torch.float32) * base_lr
                 )
                 current_state['avg_lr'] = torch.mean(current_state['lr_mask'].to(torch.float32))
-        """
-        Get average gradient sign agreement rate over recent history.
-        Returns a value between 0 and 1, where 1 means perfect stability.
-        """
+
+        if grad_history is not None:
+            self._gradient_sign_agreements = list(grad_history)
+        if loss_history is not None:
+            self.recent_losses = list(loss_history)
+
+    def get_gradient_sign_agreement_rate(self):
+        """Return the rolling average of gradient sign agreement (0-1)."""
         if not self._gradient_sign_agreements:
             return 0.0
 
-        # Use recent 100 samples or all if less
         recent = self._gradient_sign_agreements[-100:]
-        import numpy as np
-        return float(np.mean(recent))
+        return float(sum(recent) / len(recent))
 
     def get_recent_losses(self):
         """Get list of recent loss values for alpha scheduler."""
