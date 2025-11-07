@@ -182,3 +182,14 @@ cython_debug/
 aitk_db.db
 /notes.md
 /data
+# Claude Code configuration
+.claude/
+
+# Test and debug scripts (development only)
+debug_*.py
+test_*.py
+fix_*.py
+*_alternative.py
+
+# External dependencies
+k-diffusion/
