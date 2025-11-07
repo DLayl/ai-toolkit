@@ -898,15 +898,72 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # Load alpha scheduler state from separate JSON file (not in safetensors)
             if hasattr(self.network, 'alpha_scheduler') and self.network.alpha_scheduler is not None:
                 import json
-                scheduler_file = path.replace('.safetensors', '_alpha_scheduler.json')
-                if os.path.exists(scheduler_file):
-                    try:
-                        with open(scheduler_file, 'r') as f:
-                            scheduler_state = json.load(f)
-                        self.network.alpha_scheduler.load_state_dict(scheduler_state)
-                        print_acc(f"Loaded alpha scheduler state from {scheduler_file}")
-                    except Exception as e:
-                        print_acc(f"Warning: Failed to load alpha scheduler state: {e}")
+                scheduler_candidates = []
+                if path.endswith('.safetensors'):
+                    base = path[:-len('.safetensors')]
+                    scheduler_candidates.append(f"{base}_alpha_scheduler.json")
+                    for suffix in ('_low_noise', '_high_noise'):
+                        if base.endswith(suffix):
+                            scheduler_candidates.append(f"{base[:-len(suffix)]}_alpha_scheduler.json")
+                            break
+                else:
+                    scheduler_candidates.append(f"{path}_alpha_scheduler.json")
+
+                scheduler_loaded = False
+                for scheduler_file in scheduler_candidates:
+                    if os.path.exists(scheduler_file):
+                        try:
+                            with open(scheduler_file, 'r') as f:
+                                scheduler_state = json.load(f)
+
+                            loaded_phase_idx = scheduler_state.get('current_phase_idx', 0)
+                            loaded_step = scheduler_state.get('total_steps', 0)
+                            current_phase_idx = self.network.alpha_scheduler.current_phase_idx
+                            current_step = self.network.alpha_scheduler.total_steps
+                            step_delta = current_step - loaded_step
+
+                            if current_step > 0 and step_delta > 50:
+                                print_acc(f"⚠️  Blocked stale alpha scheduler from {scheduler_file}")
+                                print_acc(f"   Current: step {current_step}, phase {current_phase_idx}")
+                                print_acc(f"   File:    step {loaded_step}, phase {loaded_phase_idx} (Δ{step_delta})")
+                                print_acc(f"   Keeping current scheduler state to avoid regression")
+                                continue
+
+                            self.network.alpha_scheduler.load_state_dict(scheduler_state)
+                            phase_name = self.network.alpha_scheduler.phases[loaded_phase_idx].name \
+                                if loaded_phase_idx < len(self.network.alpha_scheduler.phases) else 'unknown'
+                            transition_count = len(scheduler_state.get('transition_history', []))
+
+                            print_acc(f"✓ Loaded alpha scheduler state from {scheduler_file}")
+                            print_acc(f"  Phase: {loaded_phase_idx} ({phase_name}) at step {loaded_step}")
+                            print_acc(f"  Transitions: {transition_count}")
+                            scheduler_loaded = True
+                        except Exception as e:
+                            print_acc(f"⚠️  Failed to load alpha scheduler state from {scheduler_file}: {e}")
+
+                        if scheduler_loaded:
+                            break
+
+                if not scheduler_loaded and self.network.alpha_scheduler.enabled:
+                    current_phase = self.network.alpha_scheduler.current_phase_idx
+                    current_step = self.network.alpha_scheduler.total_steps
+                    print_acc("")
+                    print_acc('=' * 80)
+                    print_acc("⚠️  WARNING: NO ALPHA SCHEDULER STATE LOADED")
+                    print_acc('=' * 80)
+                    print_acc("Searched candidates:")
+                    for candidate in scheduler_candidates:
+                        exists = "✓ exists" if os.path.exists(candidate) else "✗ not found"
+                        print_acc(f"  • {candidate} {exists}")
+                    print_acc("")
+                    print_acc(f"Current scheduler state: phase {current_phase}, step {current_step}")
+                    transitions = len(self.network.alpha_scheduler.transition_history)
+                    print_acc(f"Transitions recorded: {transitions}")
+                    if current_phase == 0 and current_step == 0:
+                        print_acc("🚨 CRITICAL: Scheduler is at INITIAL STATE (phase 0, step 0)")
+                        print_acc("           If this is a resume, quality may regress!")
+                    print_acc('=' * 80)
+                    print_acc("")
 
             self.load_training_state_from_metadata(path)
             return extra_weights
