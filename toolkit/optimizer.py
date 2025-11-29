@@ -97,6 +97,79 @@ def get_optimizer(
     elif lower_type == 'automagic':
         from toolkit.optimizers.automagic import Automagic
         optimizer = Automagic(params, lr=float(learning_rate), **optimizer_params)
+    elif lower_type in ('adamw_bf16', 'adamwbf16', 'adamw_bfloat16'):
+        try:
+            from adamw_bfloat16 import AdamW_BF16, LR
+        except ImportError:
+            raise ImportError(
+                "Please install adamw_bfloat16 to use AdamW_BF16 optimizer -> "
+                "pip install adamw_bfloat16 or pip install git+https://github.com/arogozhnikov/adamw_bfloat16"
+            )
+
+        # Allow dynamic parameter shapes to avoid recompilation warnings
+        # AdamW_BF16 uses torch.compile internally, and LoRA has many different tensor shapes
+        import torch._dynamo
+        import torch._dynamo.config
+        import adamw_bfloat16.torchcompiled as _tc
+        torch._dynamo.config.force_parameter_static_shapes = False
+
+        # Disable Dynamo compilation for the optimizer step to avoid shape-related recompiles entirely
+        # This is more reliable than raising recompile_limit since LoRA can have 160+ unique shapes
+        AdamW_BF16.step = torch._dynamo.disable()(AdamW_BF16.step)
+        # Also disable Dynamo on the compiled inner step function to prevent step-counter guard recompiles
+        _tc._make_step = torch._dynamo.disable()(_tc._make_step)
+
+        # Allow pickle of LR when loading optimizer states with weights_only=True
+        import torch.serialization
+        torch.serialization.add_safe_globals([LR])
+
+        print("Using AdamW_BF16 optimizer (memory-efficient bfloat16)")
+
+        # Extract LR config if provided, otherwise use defaults
+        lr_config = optimizer_params.pop('lr_config', {})
+        preheat_steps = lr_config.get('preheat_steps', 3000)
+        decay_power = lr_config.get('decay_power', -0.5)
+
+        # Create the LR scheduler function
+        lr_func = LR(
+            lr=float(learning_rate),
+            preheat_steps=preheat_steps,
+            decay_power=decay_power
+        )
+
+        print(f"  LR config: base_lr={learning_rate}, preheat_steps={preheat_steps}, decay_power={decay_power}")
+
+        # Default weight decay for AdamW
+        if 'weight_decay' not in optimizer_params:
+            optimizer_params['weight_decay'] = 0.01
+
+        optimizer = AdamW_BF16(
+            params,
+            lr_function=lr_func,
+            **optimizer_params
+        )
+
+        # Add dummy 'lr' field for compatibility with torch schedulers and logging
+        # This won't affect the optimizer's built-in LR scheduling
+        for pg in optimizer.param_groups:
+            pg.setdefault('lr', float(learning_rate))
+            pg.setdefault('initial_lr', float(learning_rate))
+
+        # Add helper method to get current LR from built-in scheduler for logging
+        def get_learning_rates(self):
+            """Get current learning rate from built-in LR scheduler."""
+            # Find the first param with state to get current step
+            for pg in self.param_groups:
+                for p in pg['params']:
+                    if p in self.state and 'step' in self.state[p]:
+                        step = self.state[p]['step']
+                        return [pg['lr_function'](step)]
+            # If no steps taken yet, return initial LR
+            return [self.param_groups[0]['lr_function'](0.0)]
+
+        # Bind the method to the optimizer instance
+        import types
+        optimizer.get_learning_rates = types.MethodType(get_learning_rates, optimizer)
     else:
         raise ValueError(f'Unknown optimizer type {optimizer_type}')
     return optimizer

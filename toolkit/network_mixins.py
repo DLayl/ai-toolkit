@@ -348,13 +348,6 @@ class ToolkitModuleMixin:
     def merge_in(self: Module, merge_weight=1.0):
         if not self.can_merge_in:
             return
-        # get up/down weight
-        if self.full_rank:
-            up_weight = None
-        else:
-            up_weight = self.lora_up.weight.clone().float()
-        down_weight = self.lora_down.weight.clone().float()
-
         # extract weight from org_module
         org_sd = self.org_module[0].state_dict()
         # todo find a way to merge in weights when doing quantized model
@@ -368,13 +361,25 @@ class ToolkitModuleMixin:
             weight_key = "weight._data"
 
         orig_dtype = org_sd[weight_key].dtype
-        weight = org_sd[weight_key].float()
+        # always anchor to the current module weight device to avoid cross-device math
+        device = self.org_module[0].weight.device
+        weight = org_sd[weight_key].float().to(device)
+
+        # get up/down weight and ensure they're on the same device as the model weight
+        if self.full_rank:
+            up_weight = None
+        else:
+            up_weight = self.lora_up.weight.clone().float().to(device)
+        down_weight = self.lora_down.weight.clone().float().to(device)
 
         multiplier = merge_weight
         scale = self.scale
         # handle trainable scaler method locon does
         if hasattr(self, 'scalar'):
             scale = scale * self.scalar
+        # ensure scale lives on same device as target weight to avoid device mismatch
+        if torch.is_tensor(scale) and scale.device != device:
+            scale = scale.to(device)
 
         weight_device = weight.device
         if weight.device != down_weight.device:
@@ -383,21 +388,24 @@ class ToolkitModuleMixin:
             scale = scale.to(down_weight.device)
         # merge weight
         if self.full_rank:
-            weight = weight + multiplier * down_weight * scale
+            weight = weight + multiplier * down_weight.to(device) * scale
         elif len(weight.size()) == 2:
             # linear
-            weight = weight + multiplier * (up_weight @ down_weight) * scale
+            weight = weight + multiplier * (up_weight.to(device) @ down_weight.to(device)) * scale
         elif down_weight.size()[2:4] == (1, 1):
             # conv2d 1x1
             weight = (
                     weight
                     + multiplier
-                    * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
+                    * (up_weight.squeeze(3).squeeze(2).to(device) @ down_weight.squeeze(3).squeeze(2).to(device)).unsqueeze(2).unsqueeze(3)
                     * scale
             )
         else:
             # conv2d 3x3
-            conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
+            conved = torch.nn.functional.conv2d(
+                down_weight.permute(1, 0, 2, 3).to(device),
+                up_weight.to(device)
+            ).permute(1, 0, 2, 3)
             # print(conved.size(), weight.size(), module.stride, module.padding)
             weight = weight + multiplier * conved * scale
 

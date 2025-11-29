@@ -1471,6 +1471,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 train_config=self.train_config,
             )
         self.adapter.to(self.device_torch, dtype=dtype)
+        # If using AdamW_BF16 and training the adapter, ensure its params are bf16
+        optimizer_type = self.train_config.optimizer.lower()
+        if self.adapter_config.train and optimizer_type in ('adamw_bf16', 'adamwbf16', 'adamw_bfloat16'):
+            self.adapter.to(self.device_torch, dtype=torch.bfloat16)
         if latest_save_path is not None and not is_control_net:
             # load adapter from path
             print_acc(f"Loading adapter from {latest_save_path}")
@@ -1747,7 +1751,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
 
                 # todo switch everything to proper mixed precision like this
-                self.network.force_to(self.device_torch, dtype=torch.float32)
+                # Use bfloat16 for LoRA when using AdamW_BF16 optimizer (requires bf16 params)
+                optimizer_type = self.train_config.optimizer.lower()
+                if optimizer_type in ('adamw_bf16', 'adamwbf16', 'adamw_bfloat16'):
+                    network_dtype = torch.bfloat16
+                    print("Using bfloat16 for LoRA weights (required by AdamW_BF16)")
+                else:
+                    network_dtype = torch.float32
+                self.network.force_to(self.device_torch, dtype=network_dtype)
                 # give network to sd so it can use it
                 self.sd.network = self.network
                 self.network._update_torch_multiplier()
@@ -1821,6 +1832,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
             if self.embed_config is not None:
                 # we are doing embedding training as well
+                # Warn if using adamw_bf16 with embeddings (embeddings are float32)
+                optimizer_type = self.train_config.optimizer.lower()
+                if optimizer_type in ('adamw_bf16', 'adamwbf16', 'adamw_bfloat16'):
+                    print("WARNING: AdamW_BF16 requires bfloat16 params, but embeddings are float32.")
+                    print("         Embedding training may fail. Consider using a different optimizer.")
                 self.embedding = Embedding(
                     sd=self.sd,
                     embed_config=self.embed_config
@@ -1936,14 +1952,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # only works for adafactor, but it should have thrown an error prior to this otherwise
             self.optimizer.enable_paramiter_swapping(self.train_config.paramiter_swapping_factor)
 
+        optimizer_type = self.train_config.optimizer.lower()
+        is_adamw_bf16 = optimizer_type in ('adamw_bf16', 'adamwbf16', 'adamw_bfloat16')
+
         # check if it exists
         optimizer_state_filename = f'optimizer.pt'
         optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
+        previous_lrs: List[float] = []
         if os.path.exists(optimizer_state_file_path):
             # try to load
             # previous param groups
             # previous_params = copy.deepcopy(optimizer.param_groups)
-            previous_lrs = []
             for group in optimizer.param_groups:
                 previous_lrs.append(group['lr'])
 
@@ -1957,7 +1976,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if load_optimizer:
                 try:
                     print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
-                    optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True)
+                    # For AdamW_BF16, allowlist LR when loading with weights_only=True; if that fails, fall back to full load
+                    if is_adamw_bf16:
+                        try:
+                            from adamw_bfloat16 import LR
+                            torch.serialization.add_safe_globals([LR])
+                        except ImportError:
+                            pass
+                    try:
+                        optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True)
+                    except Exception:
+                        # trusted local checkpoint; allow full pickle load
+                        optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=False)
                     optimizer.load_state_dict(optimizer_state_dict)
                     del optimizer_state_dict
                     flush()
@@ -1965,9 +1995,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"Failed to load optimizer state from {optimizer_state_file_path}")
                     print_acc(e)
 
-            # update the optimizer LR from the params
-            print_acc(f"Updating optimizer LR from params")
-            if len(previous_lrs) > 0:
+        # update the optimizer LR from the params
+        print_acc(f"Updating optimizer LR from params")
+        if len(previous_lrs) > 0:
+            if not is_adamw_bf16:
                 for i, group in enumerate(optimizer.param_groups):
                     group['lr'] = previous_lrs[i]
                     group['initial_lr'] = previous_lrs[i]
@@ -1977,16 +2008,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         lr_scheduler_params = self.train_config.lr_scheduler_params
 
-        # make sure it had bare minimum
-        if 'max_iterations' not in lr_scheduler_params:
-            lr_scheduler_params['total_iters'] = self.train_config.steps
+        if is_adamw_bf16:
+            # AdamW_BF16 has built-in LR scheduling, skip external scheduler
+            print("Skipping external LR scheduler (AdamW_BF16 has built-in scheduling)")
+            self.lr_scheduler = None
+        else:
+            # make sure it had bare minimum
+            if 'max_iterations' not in lr_scheduler_params:
+                lr_scheduler_params['total_iters'] = self.train_config.steps
 
-        lr_scheduler = get_lr_scheduler(
-            self.train_config.lr_scheduler,
-            optimizer,
-            **lr_scheduler_params
-        )
-        self.lr_scheduler = lr_scheduler
+            lr_scheduler = get_lr_scheduler(
+                self.train_config.lr_scheduler,
+                optimizer,
+                **lr_scheduler_params
+            )
+            self.lr_scheduler = lr_scheduler
 
         ### HOOk ###
         self.before_dataset_load()
@@ -2042,7 +2078,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # zero any gradients
         optimizer.zero_grad()
 
-        self.lr_scheduler.step(self.step_num)
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step(self.step_num)
 
         self.sd.set_device_state(self.train_device_state_preset)
         flush()

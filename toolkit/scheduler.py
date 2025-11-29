@@ -42,6 +42,14 @@ def get_lr_scheduler(
             kwargs['num_warmup_steps'] = 1000
         del kwargs['total_iters']
         return get_constant_schedule_with_warmup(optimizer, **kwargs)
+    elif name == 'cosine_with_warmup':
+        from diffusers.optimization import get_cosine_schedule_with_warmup
+        if 'num_warmup_steps' not in kwargs:
+            print(f"WARNING: num_warmup_steps not in kwargs. Using default value of 1000")
+            kwargs['num_warmup_steps'] = 1000
+        if 'total_iters' in kwargs:
+            kwargs['num_training_steps'] = kwargs.pop('total_iters')
+        return get_cosine_schedule_with_warmup(optimizer, **kwargs)
     else:
         # try to use a diffusers scheduler
         print(f"Trying to use diffusers scheduler {name}")

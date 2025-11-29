@@ -320,6 +320,17 @@ class Flux2Pipeline(DiffusionPipeline):
                     img_input = torch.cat((img_input, img_cond_seq), dim=1)
                     img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
 
+                # Ensure all inputs live on the same device/dtype as the transformer
+                model_device = next(self.transformer.parameters()).device
+                model_dtype = next(self.transformer.parameters()).dtype
+
+                img_input = img_input.to(model_device, dtype=model_dtype)
+                img_input_ids = img_input_ids.to(model_device)
+                t_vec = t_vec.to(model_device)
+                txt = txt.to(model_device, dtype=model_dtype)
+                txt_ids = txt_ids.to(model_device)
+                guidance_vec = guidance_vec.to(model_device, dtype=model_dtype)
+
                 pred = self.transformer(
                     x=img_input,
                     x_ids=img_input_ids,

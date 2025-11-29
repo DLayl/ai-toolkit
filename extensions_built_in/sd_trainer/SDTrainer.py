@@ -2072,9 +2072,12 @@ class SDTrainer(BaseSDTrainProcess):
                     self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
-                self.optimizer.step()
-
-                self.optimizer.zero_grad(set_to_none=True)
+                # prefer fused step+zero_grad if supported (AdamW_BF16)
+                try:
+                    self.optimizer.step(zero_grad=True)
+                except TypeError:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
                 if self.adapter and isinstance(self.adapter, CustomAdapter):
                     self.adapter.post_weight_update()
             if self.ema is not None:
@@ -2086,7 +2089,8 @@ class SDTrainer(BaseSDTrainProcess):
 
         # TODO Should we only step scheduler on grad step? If so, need to recalculate last step
         with self.timer('scheduler_step'):
-            self.lr_scheduler.step()
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
 
         if self.embedding is not None:
             with self.timer('restore_embeddings'):

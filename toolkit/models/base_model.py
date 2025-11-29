@@ -380,6 +380,10 @@ class BaseModel:
             # move weights on to the device
             self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
 
+        # Set device state to 'generate' BEFORE merge_in to ensure model is on correct device
+        self.save_device_state()
+        self.set_device_state_preset('generate')
+
         if network is not None:
             network = unwrap_model(self.network)
             network.eval()
@@ -393,9 +397,6 @@ class BaseModel:
                 network.merge_in(merge_weight=merge_multiplier)
         else:
             network = BlankNetwork()
-
-        self.save_device_state()
-        self.set_device_state_preset('generate')
 
         # save current seed state for training
         rng_state = torch.get_rng_state()
@@ -412,7 +413,12 @@ class BaseModel:
         if network is not None:
             start_multiplier = network.multiplier
 
-        # pipeline.to(self.device_torch)
+        # ensure pipeline tensors are created on the correct device
+        try:
+            pipeline.to(self.device_torch, torch_dtype=self.torch_dtype)
+        except Exception:
+            # fallback if pipeline.to doesn't accept torch_dtype
+            pipeline.to(self.device_torch)
 
         with network:
             with torch.no_grad():

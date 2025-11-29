@@ -1922,8 +1922,8 @@ class TextEmbeddingCachingMixin:
                 file_item.is_text_embedding_cached = True
                 i += 1
             # restore device state
-            # if did_move:
-            #     self.sd.restore_device_state()
+            if did_move:
+                self.sd.restore_device_state()
 
 
 class CLIPCachingMixin:

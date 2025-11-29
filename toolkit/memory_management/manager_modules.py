@@ -250,8 +250,10 @@ class _BouncingLinearFn(torch.autograd.Function):
                 if w_fp_gpu.dtype != target_dtype:
                     w_fp_gpu = w_fp_gpu.to(target_dtype, non_blocking=True)
                 return w_fp_gpu
-            # float path (preserve original behavior: NO dtype cast)
+            # float path: ensure dtype matches target to avoid matmul dtype mismatch
             w = cpu_w.to(device, non_blocking=True)
+            if w.dtype != target_dtype:
+                w = w.to(target_dtype, non_blocking=True)
             return w
 
         with torch.cuda.stream(transfer_stream):
